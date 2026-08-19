@@ -1,0 +1,397 @@
+name: Build2.5.0 Chain (Rust Binary + IPK + APK)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  # 🟢 第一阶段：编译 Rust 核心二进制
+  build_rust:
+    name: 1. Build Rust Core
+    runs-on: ubuntu-latest
+    outputs:
+      VERSION: ${{ steps.version.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. 读取版本号
+      - name: Get Version
+        id: version
+        run: |
+          MAKEFILE_PATH="athena-led/Makefile"
+
+          if [ ! -f "$MAKEFILE_PATH" ]; then
+            echo "⚠️ $MAKEFILE_PATH not found, using default version 1.0.0"
+            PKG_VERSION="1.0.0"
+          else
+            PKG_VERSION=$(grep "PKG_VERSION:=" "$MAKEFILE_PATH" | cut -d"=" -f2 | tr -d '[:space:]')
+            echo "✅ Found version $PKG_VERSION in $MAKEFILE_PATH"
+          fi
+
+          echo "VERSION=$PKG_VERSION" >> $GITHUB_OUTPUT
+
+      # 2. 准备 Rust 环境
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      # 3. 安装 Zig
+      - name: Install Zig & Zigbuild
+        run: |
+          pip3 install cargo-zigbuild ziglang
+
+      # 4. 编译 Rust
+      - name: Compile Rust
+        working-directory: ./athena-led
+        run: |
+          cargo zigbuild --release --target aarch64-unknown-linux-musl
+
+      # 5. 打包二进制
+      - name: Package Binary
+        id: package
+        working-directory: ./athena-led
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          FILENAME="athena-led-aarch64-unknown-linux-musl-v${VERSION}.tar.gz"
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/athena-led dist/
+          cd dist
+          tar -czvf ../$FILENAME athena-led
+          cd ..
+          sha256sum $FILENAME > $FILENAME.sha256
+          cat $FILENAME.sha256
+          echo "ASSET_NAME=$FILENAME" >> $GITHUB_OUTPUT
+          echo "✅ Packed binary: $FILENAME"
+
+      # 6. 上传 Rust 二进制到 Release
+      - name: Upload Rust Binary to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            athena-led/*.tar.gz
+            athena-led/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 6b. 手动触发时上传 Rust Artifact
+      - name: Upload Rust Binary as Artifact (Dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binary-${{ steps.version.outputs.VERSION }}
+          path: |
+            athena-led/*.tar.gz
+            athena-led/*.sha256
+          retention-days: 7
+
+      # 7. 传递给 OpenWrt 任务
+      - name: Pass Artifact to Next Job
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-binary-tarball
+          path: athena-led/*.tar.gz
+          retention-days: 1
+
+  # 🔵 第二阶段：编译 OpenWrt 安装包
+  build_openwrt:
+    name: 2. Build ${{ matrix.type }}
+    needs: build_rust
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - type: ipk
+            name: Stable (23.05)
+            sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq807x/generic"
+            use_apk: false
+          - type: apk
+            name: Snapshot (Qualcommax)
+            sdk_url: "https://downloads.openwrt.org/snapshots/targets/qualcommax/ipq60xx"
+            use_apk: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Rust Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rust-binary-tarball
+          path: local_dl/
+
+      - name: Prepare SDK
+        run: |
+          sudo apt-get update && sudo apt-get install -y zstd
+          BASE_URL="${{ matrix.sdk_url }}"
+          SDK_FILE=$(wget -qO- "$BASE_URL/sha256sums" | grep "sdk" | grep "Linux-x86_64" | head -n 1 | awk '{print $2}' | sed 's/*//g')
+          wget -q "$BASE_URL/$SDK_FILE"
+          if [[ "$SDK_FILE" == *.zst ]]; then 
+            zstd -d "$SDK_FILE" -o sdk.tar
+            tar -xf sdk.tar
+          else 
+            tar -xf "$SDK_FILE"
+          fi
+          EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n 1)
+          mv "$EXTRACTED_DIR" sdk
+
+      - name: Inject Source into SDK
+        run: |
+          mkdir -p sdk/dl
+          cp local_dl/*.tar.gz sdk/dl/
+
+      - name: Configure Feeds
+        working-directory: ./sdk
+        run: |
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: Configure .config
+        working-directory: ./sdk
+        run: |
+          cat > .config <<EOF
+          CONFIG_ALL=y
+          CONFIG_ALL_NONSHARED=y
+          CONFIG_PACKAGE_athena-led=m
+          CONFIG_PACKAGE_luci-app-athena-led=m
+          CONFIG_PACKAGE_luci=y
+          CONFIG_SIGNED_PACKAGES=n
+          EOF
+          make defconfig
+
+      - name: Compile Packages
+        working-directory: ./sdk
+        run: |
+          sudo apt-get install -y dos2unix
+          mkdir -p package/athena-led
+          cp "$GITHUB_WORKSPACE/athena-led/Makefile" package/athena-led/
+          cp -r "$GITHUB_WORKSPACE/athena-led/files" package/athena-led/
+          mkdir -p package/luci-app-athena-led
+          cp -r "$GITHUB_WORKSPACE/luci-app-athena-led"/* package/luci-app-athena-led/
+          find package/athena-led package/luci-app-athena-led -type f ! -name "*.bin" -exec dos2unix {} +
+          make package/athena-led/download V=s
+          make package/athena-led/compile V=s -j$(nproc)
+          make package/luci-app-athena-led/compile V=s -j$(nproc)
+
+      # 🌟 生成校验和
+      - name: Generate checksums
+        run: |
+          cd sdk/bin
+          find . -name "*athena-led*.${{ matrix.type }}" | while read f; do
+            sha256sum "$f"
+          done | sed 's# \./.*/# #' > sha256sums-${{ matrix.type }}.txt
+          cat sha256sums-${{ matrix.type }}.txt
+
+      # 🌟 上传到 Release (release 事件)
+      - name: Upload Packages to Release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            sdk/bin/**/*athena-led*.${{ matrix.type }}
+            sdk/bin/sha256sums-${{ matrix.type }}.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # 🌟 上传为 Artifact (手动触发)
+      - name: Upload Packages as Artifact (Dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-packages-${{ matrix.type }}
+          path: |
+            sdk/bin/**/*athena-led*.${{ matrix.type }}
+            sdk/bin/sha256sums-${{ matrix.type }}.txt
+          retention-days: 7
+
+  # 🟣 第三阶段：生成 Release Body（安装命令 + 校验说明）
+  publish_release_body:
+    name: 3. Publish Release Notes
+    needs: [build_rust, build_openwrt]
+    runs-on: ubuntu-latest
+    # 🌟 关键修复：去掉 if 限制，让两种触发方式都能跑
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: List Artifacts (Debug)
+        run: |
+          echo "=== Artifact tree ==="
+          find artifacts/ -type f | sort
+
+      - name: Generate Release Body
+        id: gen_body
+        run: |
+          set -e
+
+          # 读取版本号
+          MAKEFILE_PATH="athena-led/Makefile"
+          if [ -f "$MAKEFILE_PATH" ]; then
+            PKG_VERSION=$(grep "PKG_VERSION:=" "$MAKEFILE_PATH" | cut -d"=" -f2 | tr -d '[:space:]')
+          else
+            PKG_VERSION="${{ needs.build_rust.outputs.VERSION }}"
+          fi
+
+          TAG="${{ github.ref_name }}"
+          REPO="${{ github.repository }}"
+
+          # 如果是手动触发，用一个默认 tag 名
+          if [ "$TAG" = "" ] || [ "$TAG" = "refs/heads/main" ]; then
+            TAG="v${PKG_VERSION}"
+          fi
+
+          # 收集 IPK / APK 文件名
+          IPK_LIST=""
+          APK_LIST=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            case "$base" in
+              *.ipk)  IPK_LIST+="- \`$base\`"$'\n' ;;
+              *.apk)  APK_LIST+="- \`$base\`"$'\n' ;;
+            esac
+          done < <(find artifacts/ -type f \( -name "*.ipk" -o -name "*.apk" \) | sort)
+
+          # 收集校验和
+          CHECKSUMS=""
+          while IFS= read -r f; do
+            [ -f "$f" ] || continue
+            base=$(basename "$f")
+            CHECKSUMS+=$'\n'"**${base}**"$'\n'
+            CHECKSUMS+=$(cat "$f")$'\n'
+          done < <(find artifacts/ -type f -name "sha256sums-*.txt" | sort)
+
+          # 生成 release_notes.md
+          {
+            echo "## 🚀 Athena LED v${PKG_VERSION} 发布说明"
+            echo ""
+            echo "### 📦 安装包清单"
+            echo ""
+            echo "#### OpenWrt 23.05 (Stable) — IPK 格式"
+            echo "${IPK_LIST:-（本次未生成）}"
+            echo ""
+            echo "#### OpenWrt Snapshot (Qualcommax) — APK 格式"
+            echo "${APK_LIST:-（本次未生成）}"
+            echo ""
+            echo "### 🛠️ 安装命令"
+            echo ""
+            echo "#### 方式一：一键安装脚本（推荐）"
+            echo ""
+            echo '```bash'
+            echo "# 下载"
+            echo "cd /tmp"
+            echo "wget https://github.com/${REPO}/releases/download/${TAG}/athena-led_${PKG_VERSION}_aarch64_generic.ipk"
+            echo "wget https://github.com/${REPO}/releases/download/${TAG}/luci-app-athena-led_${PKG_VERSION}_all.ipk"
+            echo ""
+            echo "# IPK 系统 (OpenWrt 23.05 及更早)"
+            echo "opkg install athena-led_${PKG_VERSION}_aarch64_generic.ipk"
+            echo "opkg install luci-app-athena-led_${PKG_VERSION}_all.ipk"
+            echo ""
+            echo "# APK 系统 (OpenWrt 24.10+ / Snapshot)"
+            echo "# apk add --allow-untrusted athena-led-${PKG_VERSION}-r1.apk"
+            echo "# apk add --allow-untrusted luci-app-athena-led-${PKG_VERSION}-r1.apk"
+            echo '```'
+            echo ""
+            echo "#### 方式二：手动上传安装"
+            echo ""
+            echo "1. 从下方 Assets 下载对应架构的 \`.ipk\` 或 \`.apk\` 文件"
+            echo "2. 通过 SCP / WinSCP 上传到路由器 \`/tmp\` 目录"
+            echo "3. SSH 登录路由器执行安装命令"
+            echo ""
+            echo "### 🔐 校验下载完整性"
+            echo ""
+            echo "下载后请务必校验 SHA256："
+            echo ""
+            echo '```bash'
+            echo "wget https://github.com/${REPO}/releases/download/${TAG}/sha256sums-ipk.txt"
+            echo "wget https://github.com/${REPO}/releases/download/${TAG}/sha256sums-apk.txt"
+            echo "sha256sum -c sha256sums-ipk.txt"
+            echo "sha256sum -c sha256sums-apk.txt"
+            echo '```'
+            echo ""
+            echo "预期输出：每个文件显示 \`OK\`"
+            echo ""
+            echo "### 📋 完整校验和"
+            echo ""
+            echo '```'
+            echo "${CHECKSUMS:-无校验和文件}"
+            echo '```'
+            echo ""
+            echo "### ⚠️ 注意事项"
+            echo ""
+            echo "- **IPK** 适用于 OpenWrt 23.05 及更早版本（使用 \`opkg\`）"
+            echo "- **APK** 适用于 OpenWrt 24.10+ / Snapshot（使用 \`apk\`，Qualcommax 平台）"
+            echo "- 安装前请确保路由器架构匹配（aarch64）"
+            echo "- 安装后访问路由器 LuCI 界面 → Services → Athena LED 进行配置"
+            echo ""
+            echo "### 🔄 升级说明"
+            echo ""
+            echo '```bash'
+            echo "# IPK 升级"
+            echo "opkg upgrade athena-led luci-app-athena-led"
+            echo ""
+            echo "# APK 升级"
+            echo "apk upgrade athena-led luci-app-athena-led"
+            echo '```'
+            echo ""
+            echo "### 🐛 问题反馈"
+            echo ""
+            echo "如遇问题请提交 Issue，附上："
+            echo "- 路由器型号 & 架构"
+            echo "- OpenWrt 版本"
+            echo "- 安装日志（\`logread\` 输出）"
+          } > release_notes.md
+
+          echo "=== Generated Release Notes ==="
+          cat release_notes.md
+
+      # Release 事件 → 直接写入 Release Body
+      - name: Update Release Body (Release event)
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+              --notes-file release_notes.md
+          echo "✅ Release body updated successfully"
+
+      # 手动触发 → 创建 Pre-release 并写入 Notes
+      - name: Create/Update Release (Dispatch event)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${{ needs.build_rust.outputs.VERSION }}"
+          
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "📝 Updating existing release $TAG"
+            gh release edit "$TAG" --notes-file release_notes.md
+          else
+            echo "🆕 Creating new pre-release $TAG"
+            gh release create "$TAG" \
+              --title "Athena LED $TAG (CI Build)" \
+              --notes-file release_notes.md \
+              --prerelease
+          fi
+          echo "✅ Release notes published for $TAG"
+
+      # 兜底：无论如何都把 Notes 作为 Artifact 保留
+      - name: Upload Release Notes as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release_notes.md
+          retention-days: 7
