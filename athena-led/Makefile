@@ -16,7 +16,7 @@ PKG_LICENSE_FILES:=LICENSE
 PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v$(PKG_VERSION).tar.gz
 PKG_SOURCE_URL:=https://github.com/guangyin53222/JDC-AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
 # 建议后续计算真实 sha256 替换 skip，避免下载被篡改
-PKG_HASH:=a601bdafd169a4b15373a7c695cff9328419f0739191ae243e1b7284ef8fee70
+PKG_HASH:=2e6a8a54efeedbb272e67e5a0134494d5e34e062adfb5a702494946d42cf36be
 
 include $(INCLUDE_DIR)/package.mk
 
