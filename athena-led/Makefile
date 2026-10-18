@@ -8,12 +8,14 @@ PKG_NAME:=athena-led
 PKG_VERSION:=2.5.0
 PKG_RELEASE:=1
 
-PKG_MAINTAINER:=unraveloop <https://github.com/unraveloop>
+PKG_MAINTAINER:=guangyin53222 <https://github.com/guangyin53222>
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 
+# 资产名与你的 Release 一致: athena-led-aarch64-unknown-linux-musl-v2.5.0.tar.gz
 PKG_SOURCE:=athena-led-aarch64-unknown-linux-musl-v$(PKG_VERSION).tar.gz
-PKG_SOURCE_URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
+PKG_SOURCE_URL:=https://github.com/guangyin53222/JDC-AX6600-Athena-LED-Controller/releases/download/v$(PKG_VERSION)/
+# 建议后续计算真实 sha256 替换 skip，避免下载被篡改
 PKG_HASH:=skip
 
 include $(INCLUDE_DIR)/package.mk
@@ -22,13 +24,13 @@ define Package/$(PKG_NAME)
 	SECTION:=utils
 	CATEGORY:=Utilities
 	TITLE:=JDCloud AX6600 (Athena) LED matrix screen daemon
-	URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller
+	URL:=https://github.com/guangyin53222/JDC-AX6600-Athena-LED-Controller
 	DEPENDS:=@(aarch64||arm)
 endef
 
 define Package/$(PKG_NAME)/description
 Rust daemon driving the JDCloud AX6600 (Athena) LED matrix screen.
-v2.3.0: dual GPIO backend (character device /dev/gpiochipN with
+v2.5.0: dual GPIO backend (character device /dev/gpiochipN with
 sysfs fallback), works across QWRT / iStoreOS / official OpenWrt
 kernels without hardcoded GPIO numbers.
 endef
@@ -47,7 +49,7 @@ define Package/$(PKG_NAME)/conffiles
 endef
 
 define Package/$(PKG_NAME)/install
-	# 1. 主程序
+	# 1. 主程序 (注意：tar.gz 解压后可能带目录层级，若直接放根目录可加 --strip-components=1)
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) $(PKG_BUILD_DIR)/athena-led $(1)/usr/bin/
 
