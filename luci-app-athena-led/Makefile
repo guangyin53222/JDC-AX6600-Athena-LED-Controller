@@ -1,12 +1,5 @@
 # 🌟 [包拆分 + JS化] luci-app-athena-led — 纯 Web 界面包 (v2.3.0)
 # 核心程序/init/config/动画 已拆到 athena-led 包 (见 ../athena-led/Makefile)
-#
-# v2.3.0 起界面为 LuCI JS 架构 (htdocs/)，不再依赖 luci-compat，
-# 彻底解决 QWRT 等新版固件上 “装完 Lua 插件整个管理页崩溃” 的问题。
-# 旧 Lua CBI 界面保留在 luasrc/ 目录中【未安装】。如需回退:
-#   1. DEPENDS 加回 +luci-compat
-#   2. 注释掉下方 JS 安装段 (htdocs/menu.d/acl.d)
-#   3. 恢复安装 luasrc: $(CP) ./luasrc/* $(1)/usr/lib/lua/luci/
 
 include $(TOPDIR)/rules.mk
 
@@ -14,7 +7,7 @@ PKG_NAME:=luci-app-athena-led
 PKG_VERSION:=2.5.0
 PKG_RELEASE:=1
 
-PKG_MAINTAINER:=unraveloop <https://github.com/unraveloop>
+PKG_MAINTAINER:=guangyin53222 <https://github.com/guangyin53222>
 PKG_LICENSE:=Apache-2.0
 PKG_LICENSE_FILES:=LICENSE
 
@@ -25,7 +18,7 @@ define Package/$(PKG_NAME)
 	CATEGORY:=LuCI
 	SUBMENU:=3. Applications
 	TITLE:=LuCI Support for Athena LED (JS UI)
-	URL:=https://github.com/unraveloop/JDC-AX6600-Athena-LED-Controller
+	URL:=https://github.com/guangyin53222/JDC-AX6600-Athena-LED-Controller
 	DEPENDS:=+athena-led +luci-base
 	PKGARCH:=all
 endef
