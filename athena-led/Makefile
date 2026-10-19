@@ -22,7 +22,7 @@ include $(INCLUDE_DIR)/package.mk
 define Package/$(PKG_NAME)
   SECTION:=utils
   CATEGORY:=Utilities
-  DEPENDS:=@TARGET_qualcommax_ipq807x +libc
+  DEPENDS:=@TARGET_qualcommax
   TITLE:=Athena LED controller (backend)
 endef
 
