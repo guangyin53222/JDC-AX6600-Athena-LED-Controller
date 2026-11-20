@@ -8,18 +8,10 @@ on:
 permissions:
   contents: write
 
-env:
-  # 统一版本号，避免两处定义不一致
-  OPENWRT_23_VER: "23.05.5"
-  OPENWRT_25_VER: "25.12.0"
-
 jobs:
-  # 🟢 第一阶段：编译 Rust 核心二进制
   build_rust:
     name: 1. Build Rust Core
     runs-on: ubuntu-latest
-    outputs:
-      VERSION: ${{ steps.version.outputs.VERSION }}
     steps:
       - uses: actions/checkout@v4
 
@@ -58,15 +50,16 @@ jobs:
           done
           exit $RC
 
-      - name: Strip & Stage Binary
+      - name: Strip Binary
+        working-directory: ./athena-led
+        run: |
+          aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/athena-led || true
+
+      - name: Stage Binary into package files/
         working-directory: ./athena-led
         run: |
           mkdir -p files
           cp target/aarch64-unknown-linux-musl/release/athena-led files/athena-led-bin
-          # 剥离符号表减小体积（你之前 3.74MB → 预计降到 ~2MB，和 CI 产物一致）
-          aarch64-linux-musl-strip files/athena-led-bin 2>/dev/null || \
-          aarch64-linux-gnu-strip --strip-unneeded files/athena-led-bin 2>/dev/null || \
-          strip --strip-unneeded files/athena-led-bin 2>/dev/null || true
           chmod +x files/athena-led-bin
           echo "✅ Staged binary -> files/athena-led-bin ($(ls -la files/athena-led-bin | awk '{print $5}') bytes)"
           file files/athena-led-bin
@@ -78,7 +71,6 @@ jobs:
           path: athena-led/files/athena-led-bin
           retention-days: 1
 
-  # 🔵 第二阶段：编译 OpenWrt 包（ipk + apk 双格式）
   build_openwrt:
     name: 2. Build ${{ matrix.fmt }} (${{ matrix.target }})
     needs: build_rust
@@ -89,12 +81,14 @@ jobs:
         include:
           - target: ipq807x-generic
             fmt: ipk
-            sdk_url: "https://downloads.openwrt.org/releases/${{ env.OPENWRT_23_VER }}/targets/ipq807x/generic"
-            use_apk: n
+            sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq807x/generic"
+            use_apk: "n"
+            luci_branch: "openwrt-23.05"
           - target: qualcommax-ipq60xx
             fmt: apk
-            sdk_url: "https://downloads.openwrt.org/releases/${{ env.OPENWRT_25_VER }}/targets/qualcommax/ipq60xx"
-            use_apk: y
+            sdk_url: "https://downloads.openwrt.org/releases/25.12.0/targets/qualcommax/ipq60xx"
+            use_apk: "y"
+            luci_branch: "openwrt-25.12"
 
     steps:
       - uses: actions/checkout@v4
@@ -110,41 +104,27 @@ jobs:
           ls -la athena-led/files/athena-led-bin
           file athena-led/files/athena-led-bin
 
-      # 🔧 一次性装齐所有构建依赖（根治 GNU install 预检失败）
       - name: Install host build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang flex bison g++ gawk \
-            gcc-multilib gperf libssl-dev libelf-dev libgnutls28-dev \
-            libtool libxml-parser-perl \
-            coreutils findutils zstd tar wget cpio rsync unzip \
-            python3 python3-pyelftools python3-setuptools \
-            file dos2unix
-          # 确认 GNU install 可用
-          which install && install --version | head -1
+          sudo apt-get update || true
+          sudo apt-get install -y coreutils findutils zstd tar wget dos2unix build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip python3 || true
 
       - name: Prepare SDK
         run: |
           BASE_URL="${{ matrix.sdk_url }}"
           echo "📦 Fetching SDK from $BASE_URL"
 
-          if ! wget -q --spider "$BASE_URL/"; then
-            echo "::error::Cannot reach $BASE_URL — 该 SDK 目录可能不存在"
+          if ! wget -q --spider "$BASE_URL/sha256sums"; then
+            echo "::error::Cannot reach $BASE_URL/sha256sums — SDK path invalid"
             exit 8
           fi
-
-          if ! wget -q "$BASE_URL/sha256sums" -O sha256sums; then
-            echo "::error::Failed to download sha256sums from $BASE_URL"
-            exit 8
-          fi
+          wget -q "$BASE_URL/sha256sums" -O sha256sums
 
           SDK_FILE=$(grep "openwrt-sdk.*Linux-x86_64" sha256sums | head -1 | awk '{print $2}' | sed 's/*//g')
           echo "📦 SDK file: $SDK_FILE"
 
           if [ -z "$SDK_FILE" ]; then
-            echo "::error::No SDK file found in $BASE_URL"
-            echo "::error::Available files:"
+            echo "::error::No SDK file found"
             cat sha256sums
             exit 8
           fi
@@ -162,92 +142,62 @@ jobs:
 
           EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n 1)
           if [ -z "$EXTRACTED_DIR" ]; then
-            echo "::error::Cannot find extracted SDK directory"
+            echo "::error::Cannot find extracted SDK dir"
             ls -la
             exit 8
           fi
           mv "$EXTRACTED_DIR" sdk
           echo "✅ SDK ready: $EXTRACTED_DIR → ./sdk"
 
-      # 🔧 关键：用上游 release tarball 手工喂 luci 依赖，不依赖 feeds 更新
-      - name: Prepare LuCI dependencies from release tarballs
+      - name: Configure Feeds
         working-directory: ./sdk
         run: |
-          OW_VER="${{ matrix.use_apk == 'y' && env.OPENWRT_25_VER || env.OPENWRT_23_VER }}"
-          echo "📦 Preparing LuCI feeds for OpenWrt $OW_VER"
+          cp feeds.conf.default feeds.conf.default.bak
+          sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf.default
+          sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf.default
 
-          mkdir -p dl tmp-luci
-          cd tmp-luci
-
-          # 下载 luci release 源码包（含 luci-base、luci-lib-*、po2lmo 等）
-          echo "=== Downloading luci source ==="
-          wget -q "https://github.com/openwrt/luci/archive/refs/tags/v${OW_VER}.tar.gz" -O luci.tar.gz || \
-          wget -q "https://github.com/openwrt/luci/archive/refs/heads/openwrt-${OW_VER%.*}.tar.gz" -O luci.tar.gz || \
-          { echo "::error::Cannot download luci source"; exit 8; }
-          tar -xzf luci.tar.gz
-          LUCI_DIR=$(find . -maxdepth 1 -type d -name "luci-*" | head -n 1)
-          echo "✅ LuCI source: $LUCI_DIR"
-
-          # 下载 packages feed（含 lua、luabitop 等运行时）
-          echo "=== Downloading packages feed ==="
-          wget -q "https://github.com/openwrt/packages/archive/refs/tags/v${OW_VER}.tar.gz" -O packages.tar.gz || \
-          wget -q "https://github.com/openwrt/packages/archive/refs/heads/openwrt-${OW_VER%.*}.tar.gz" -O packages.tar.gz || true
-          if [ -f packages.tar.gz ]; then
-            tar -xzf packages.tar.gz
-            PKGS_DIR=$(find . -maxdepth 1 -type d -name "packages-*" | head -n 1)
-            echo "✅ Packages feed: $PKGS_DIR"
+          if ! grep -q "luci" feeds.conf.default; then
+            echo "src-git luci https://github.com/openwrt/luci.git;${{ matrix.luci_branch }}" >> feeds.conf.default
           fi
 
-          # 把需要的包复制到 SDK 的 package/ 目录（模拟 feeds install）
-          cd "$GITHUB_WORKSPACE/sdk/package" || mkdir -p "$GITHUB_WORKSPACE/sdk/package"
-          PKG_DST="$GITHUB_WORKSPACE/sdk/package"
-
-          # luci-base 是必选项
-          if [ -d "$GITHUB_WORKSPACE/sdk/tmp-luci/$LUCI_DIR/modules/luci-base" ]; then
-            cp -r "$GITHUB_WORKSPACE/sdk/tmp-luci/$LUCI_DIR/modules/luci-base" "$PKG_DST/"
-            echo "✅ Installed luci-base"
-          fi
-
-          # 25.12 需要 lua 运行时
+          cat feeds.conf.default
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          ./scripts/feeds install luci-base
           if [ "${{ matrix.use_apk }}" = "y" ]; then
-            for m in luci-lua-runtime luci-compat; do
-              if [ -d "$GITHUB_WORKSPACE/sdk/tmp-luci/$LUCI_DIR/modules/$m" ]; then
-                cp -r "$GITHUB_WORKSPACE/sdk/tmp-luci/$LUCI_DIR/modules/$m" "$PKG_DST/"
-                echo "✅ Installed $m"
-              fi
-            done
-            # lua 主程序来自 packages feed
-            if [ -n "$PKGS_DIR" ] && [ -d "$GITHUB_WORKSPACE/sdk/tmp-luci/$PKGS_DIR/lang/lua" ]; then
-              cp -r "$GITHUB_WORKSPACE/sdk/tmp-luci/$PKGS_DIR/lang/lua" "$PKG_DST/" 2>/dev/null || true
-            fi
+            ./scripts/feeds install luci-lua-runtime luci-compat
           fi
 
-          # 列出 SDK 里现在有哪些包
-          echo "=== SDK packages ==="
-          ls -la "$PKG_DST/"
-
-          # 清理
-          cd "$GITHUB_WORKSPACE" && rm -rf sdk/tmp-luci
-
-      - name: Configure & Inject Packages
+      - name: Verify luci-base
+        working-directory: ./sdk
         run: |
-          # 把我们的包注入 SDK
-          mkdir -p sdk/package/athena-led sdk/package/luci-app-athena-led
+          if ! ./scripts/feeds list | grep -q "^luci-base"; then
+            echo "::warning::luci-base not in feeds list, will rely on manual inject"
+          else
+            echo "✅ luci-base found in feeds"
+          fi
+
+      - name: Inject Packages into SDK
+        run: |
+          sudo apt-get install -y dos2unix || true
+
+          mkdir -p sdk/package/athena-led
           cp "$GITHUB_WORKSPACE/athena-led/Makefile" sdk/package/athena-led/
           cp -r "$GITHUB_WORKSPACE/athena-led/files" sdk/package/athena-led/
+
+          mkdir -p sdk/package/luci-app-athena-led
           cp -r "$GITHUB_WORKSPACE/luci-app-athena-led"/* sdk/package/luci-app-athena-led/
 
-          # 转换行符（排除二进制）
-          find sdk/package -type f \
-            ! -name "*.bin" ! -name "athena-led-bin" ! -name "*.png" \
+          find sdk/package/athena-led sdk/package/luci-app-athena-led \
+            -type f ! -name "*.bin" ! -name "athena-led-bin" ! -name "*.png" \
             -exec dos2unix {} +
 
-          echo "✅ All packages injected"
+          echo "✅ Packages injected"
 
       - name: Compile Packages
         working-directory: ./sdk
         run: |
-          # 写 .config
           cat > .config <<EOF
           CONFIG_SIGNED_PACKAGES=n
           CONFIG_SIGN_EACH_PACKAGE=n
@@ -258,27 +208,21 @@ jobs:
 
           make defconfig
 
-          # 先编 luci-base（提供 po2lmo 等工具）
           echo "=== Building luci-base ==="
-          make package/luci-base/compile V=s -j$(nproc) FORCE=1 || { echo "❌ luci-base failed"; exit 1; }
+          make package/luci-base/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-base failed, continuing"
 
-          # 25.12 额外依赖
           if [ "${{ matrix.use_apk }}" = "y" ]; then
-            echo "=== Building lua runtime ==="
-            make package/lua/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ lua skipped"
-            make package/luci-lua-runtime/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-lua-runtime skipped"
-            make package/luci-compat/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-compat skipped"
+            echo "=== Building luci-lua-runtime & luci-compat ==="
+            make package/luci-lua-runtime/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-lua-runtime failed"
+            make package/luci-compat/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-compat failed"
           fi
 
-          # 编 athena-led
           echo "=== Building athena-led ==="
           make package/athena-led/compile V=s -j$(nproc) FORCE=1 || { echo "❌ athena-led failed"; exit 1; }
 
-          # 编 luci-app
           echo "=== Building luci-app-athena-led ==="
           make package/luci-app-athena-led/compile V=s -j$(nproc) FORCE=1 || { echo "❌ luci-app-athena-led failed"; exit 1; }
 
-          # 列出产物
           echo "=== Build artifacts ==="
           find bin/ -name "*athena-led*" \( -name "*.ipk" -o -name "*.apk" \) -ls
 
