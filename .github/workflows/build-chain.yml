@@ -81,13 +81,11 @@ jobs:
             fmt: ipk
             sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq807x/generic"
             use_apk: n
-            pkg_arch: aarch64_cortex-a53
           # 25.12 → apk（apk 固件，官方 OpenWrt 25.12+）
           - target: qualcommax-ipq60xx
             fmt: apk
             sdk_url: "https://downloads.openwrt.org/releases/25.12.0/targets/qualcommax/ipq60xx"
             use_apk: y
-            pkg_arch: aarch64_cortex-a53
 
     steps:
       - uses: actions/checkout@v4
@@ -103,26 +101,34 @@ jobs:
           ls -la athena-led/files/athena-led-bin
           file athena-led/files/athena-led-bin
 
-      - name: Prepare SDK
+      - name: Install build prereqs
         run: |
           sudo apt-get update || true
-          sudo apt-get install -y zstd tar wget || true
+          sudo apt-get install -y coreutils findutils zstd tar wget dos2unix
 
+      - name: Prepare SDK
+        run: |
           BASE_URL="${{ matrix.sdk_url }}"
           echo "📦 Fetching SDK from $BASE_URL"
 
-          # 下载 sha256sums 确认文件存在
-          if ! wget -q --spider "$BASE_URL/sha256sums"; then
-            echo "::error::Cannot reach $BASE_URL/sha256sums — 该 SDK 路径可能不存在"
+          # 先确认目录可达
+          if ! wget -q --spider "$BASE_URL/"; then
+            echo "::error::Cannot reach $BASE_URL — 该 SDK 目录可能不存在"
             exit 8
           fi
-          wget -q "$BASE_URL/sha256sums" -O sha256sums
+
+          # 下载索引，检查 SDK 文件是否存在
+          if ! wget -q "$BASE_URL/sha256sums" -O sha256sums; then
+            echo "::error::Failed to download sha256sums from $BASE_URL"
+            exit 8
+          fi
 
           SDK_FILE=$(grep "openwrt-sdk.*Linux-x86_64" sha256sums | head -1 | awk '{print $2}' | sed 's/*//g')
           echo "📦 SDK file: $SDK_FILE"
 
           if [ -z "$SDK_FILE" ]; then
             echo "::error::No SDK file found in $BASE_URL"
+            echo "::error::Available files:"
             cat sha256sums
             exit 8
           fi
@@ -165,10 +171,14 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      - name: Verify luci-base available
+        working-directory: ./sdk
+        run: |
+          echo "=== Checking luci-base ==="
+          ./scripts/feeds list -s | grep -E "luci-base|luci-lib|luci-lua-runtime" || echo "⚠️ luci-base not found in feeds list"
+
       - name: Inject Packages into SDK
         run: |
-          sudo apt-get install -y dos2unix || true
-
           # 1. athena-led 核心包
           mkdir -p sdk/package/athena-led
           cp "$GITHUB_WORKSPACE/athena-led/Makefile" sdk/package/athena-led/
@@ -188,7 +198,7 @@ jobs:
       - name: Compile Packages
         working-directory: ./sdk
         run: |
-          # 写 .config
+          # 写 .config（关闭签名，避免无密钥崩溃）
           cat > .config <<EOF
           CONFIG_SIGNED_PACKAGES=n
           CONFIG_SIGN_EACH_PACKAGE=n
@@ -201,22 +211,22 @@ jobs:
 
           # 先编 luci-base（luci-app 依赖）
           echo "=== Building luci-base ==="
-          make package/luci-base/compile V=s -j$(nproc) || echo "⚠️ luci-base compile failed, continuing anyway"
+          make package/luci-base/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-base compile failed, continuing anyway"
 
           # 25.12 需要 luci-lua-runtime + luci-compat
           if [ "${{ matrix.use_apk }}" = "y" ]; then
             echo "=== Building luci-lua-runtime & luci-compat ==="
-            make package/luci-lua-runtime/compile V=s -j$(nproc) || echo "⚠️ luci-lua-runtime failed"
-            make package/luci-compat/compile V=s -j$(nproc) || echo "⚠️ luci-compat failed"
+            make package/luci-lua-runtime/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-lua-runtime failed"
+            make package/luci-compat/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-compat failed"
           fi
 
           # 编 athena-led
           echo "=== Building athena-led ==="
-          make package/athena-led/compile V=s -j$(nproc)
+          make package/athena-led/compile V=s -j$(nproc) FORCE=1
 
           # 编 luci-app
           echo "=== Building luci-app-athena-led ==="
-          make package/luci-app-athena-led/compile V=s -j$(nproc)
+          make package/luci-app-athena-led/compile V=s -j$(nproc) FORCE=1
 
           # 列出产物
           echo "=== Build artifacts ==="
