@@ -1,4 +1,4 @@
-name: Build Chain (Rust Binary + IPK)
+name: Build Chain (Rust Binary + IPK + APK)
 
 on:
   release:
@@ -9,14 +9,13 @@ permissions:
   contents: write
 
 jobs:
-  # 🟢 第一阶段：编译 Rust 核心二进制
+  # 🟢 第一阶段：编译 Rust 核心二进制（只跑一次）
   build_rust:
     name: 1. Build Rust Core
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 1. 读取版本号
       - name: Get Version
         id: version
         run: |
@@ -30,18 +29,15 @@ jobs:
           fi
           echo "VERSION=$PKG_VERSION" >> $GITHUB_OUTPUT
 
-      # 2. 准备 Rust 环境
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      # 3. 安装 Zig (解决 ring 编译报错)
       - name: Install Zig & Zigbuild
         run: |
           pip3 install cargo-zigbuild ziglang
 
-      # 4. 编译 Rust
       - name: Compile Rust
         working-directory: ./athena-led
         run: |
@@ -55,7 +51,6 @@ jobs:
           done
           exit $RC
 
-      # 5. 打包二进制 → athena-led/files/athena-led-bin
       - name: Stage Binary into package files/
         working-directory: ./athena-led
         run: |
@@ -63,11 +58,8 @@ jobs:
           cp target/aarch64-unknown-linux-musl/release/athena-led files/athena-led-bin
           chmod +x files/athena-led-bin
           echo "✅ Staged binary -> files/athena-led-bin ($(ls -la files/athena-led-bin | awk '{print $5}') bytes)"
-
-          # 验证二进制有效
           file files/athena-led-bin
 
-      # 6. 上传 artifact 给下一阶段
       - name: Upload Rust Binary Artifact
         uses: actions/upload-artifact@v4
         with:
@@ -75,17 +67,27 @@ jobs:
           path: athena-led/files/athena-led-bin
           retention-days: 1
 
-  # 🔵 第二阶段：编译 OpenWrt IPK 包
+  # 🔵 第二阶段：编译 OpenWrt 包（ipk + apk 双格式）
   build_openwrt:
-    name: 2. Build IPK (${{ matrix.target }})
+    name: 2. Build ${{ matrix.fmt }} (${{ matrix.target }})
     needs: build_rust
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - target: ipq60xx-generic
-            sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq60xx/generic"
+          # 23.05 → ipk（opkg 固件，AX6600/QWRT/iStoreOS）
+          - target: ipq807x-generic
+            fmt: ipk
+            sdk_url: "https://downloads.openwrt.org/releases/23.05.5/targets/ipq807x/generic"
+            use_apk: n
+            pkg_arch: aarch64_cortex-a53
+          # 25.12 → apk（apk 固件，官方 OpenWrt 25.12+）
+          - target: qualcommax-ipq60xx
+            fmt: apk
+            sdk_url: "https://downloads.openwrt.org/releases/25.12.0/targets/qualcommax/ipq60xx"
+            use_apk: y
+            pkg_arch: aarch64_cortex-a53
 
     steps:
       - uses: actions/checkout@v4
@@ -104,25 +106,30 @@ jobs:
       - name: Prepare SDK
         run: |
           sudo apt-get update || true
-          sudo apt-get install -y zstd tar || true
+          sudo apt-get install -y zstd tar wget || true
 
           BASE_URL="${{ matrix.sdk_url }}"
           echo "📦 Fetching SDK from $BASE_URL"
 
-          # 下载 sha256sums 找到 SDK 文件名
+          # 下载 sha256sums 确认文件存在
+          if ! wget -q --spider "$BASE_URL/sha256sums"; then
+            echo "::error::Cannot reach $BASE_URL/sha256sums — 该 SDK 路径可能不存在"
+            exit 8
+          fi
           wget -q "$BASE_URL/sha256sums" -O sha256sums
+
           SDK_FILE=$(grep "openwrt-sdk.*Linux-x86_64" sha256sums | head -1 | awk '{print $2}' | sed 's/*//g')
           echo "📦 SDK file: $SDK_FILE"
 
           if [ -z "$SDK_FILE" ]; then
-            echo "::error::Cannot find SDK file in sha256sums"
+            echo "::error::No SDK file found in $BASE_URL"
             cat sha256sums
-            exit 1
+            exit 8
           fi
 
-          wget -q "$BASE_URL/$SDK_FILE"
+          wget -q "$BASE_URL/$SDK_FILE" || { echo "::error::Failed to download $SDK_FILE"; exit 8; }
 
-          # 解压（支持 .tar.xz 和 .tar.zst）
+          # 解压
           if [[ "$SDK_FILE" == *.xz ]]; then
             tar -xf "$SDK_FILE"
           elif [[ "$SDK_FILE" == *.zst ]]; then
@@ -132,24 +139,22 @@ jobs:
             tar -xf "$SDK_FILE"
           fi
 
-          # 找到解压目录
           EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "openwrt-sdk-*" | head -n 1)
           if [ -z "$EXTRACTED_DIR" ]; then
             echo "::error::Cannot find extracted SDK directory"
             ls -la
-            exit 1
+            exit 8
           fi
           mv "$EXTRACTED_DIR" sdk
-          echo "✅ SDK extracted to ./sdk"
+          echo "✅ SDK ready: $EXTRACTED_DIR → ./sdk"
 
       - name: Configure Feeds
         working-directory: ./sdk
         run: |
-          # 打印原始 feeds 配置
           echo "=== feeds.conf.default before ==="
           cat feeds.conf.default
 
-          # 替换 git.openwrt.org → github.com（避免连接超时）
+          # git.openwrt.org → github 镜像（避免连接超时）
           sed -i 's|git.openwrt.org/openwrt/openwrt.git|github.com/openwrt/openwrt.git|g' feeds.conf.default
           sed -i 's|git.openwrt.org/feed/packages.git|github.com/openwrt/packages.git|g' feeds.conf.default
           sed -i 's|git.openwrt.org/project/luci.git|github.com/openwrt/luci.git|g' feeds.conf.default
@@ -159,12 +164,6 @@ jobs:
 
           ./scripts/feeds update -a
           ./scripts/feeds install -a
-
-      - name: Verify luci-base available
-        working-directory: ./sdk
-        run: |
-          echo "=== Checking luci-base ==="
-          ./scripts/feeds list -s | grep -E "luci-base|luci-lib" || echo "⚠️ luci-base not found in feeds list"
 
       - name: Inject Packages into SDK
         run: |
@@ -179,7 +178,7 @@ jobs:
           mkdir -p sdk/package/luci-app-athena-led
           cp -r "$GITHUB_WORKSPACE/luci-app-athena-led"/* sdk/package/luci-app-athena-led/
 
-          # 3. 转换行符（排除二进制文件）
+          # 3. 转换行符（排除二进制）
           find sdk/package/athena-led sdk/package/luci-app-athena-led \
             -type f ! -name "*.bin" ! -name "athena-led-bin" ! -name "*.png" \
             -exec dos2unix {} +
@@ -192,32 +191,41 @@ jobs:
           # 写 .config
           cat > .config <<EOF
           CONFIG_SIGNED_PACKAGES=n
+          CONFIG_SIGN_EACH_PACKAGE=n
+          CONFIG_USE_APK=${{ matrix.use_apk }}
           CONFIG_PACKAGE_athena-led=m
           CONFIG_PACKAGE_luci-app-athena-led=m
           EOF
 
           make defconfig
 
-          # 先编 luci-base（luci-app 依赖它）
+          # 先编 luci-base（luci-app 依赖）
           echo "=== Building luci-base ==="
           make package/luci-base/compile V=s -j$(nproc) || echo "⚠️ luci-base compile failed, continuing anyway"
 
-          # 编 athena-led 核心
+          # 25.12 需要 luci-lua-runtime + luci-compat
+          if [ "${{ matrix.use_apk }}" = "y" ]; then
+            echo "=== Building luci-lua-runtime & luci-compat ==="
+            make package/luci-lua-runtime/compile V=s -j$(nproc) || echo "⚠️ luci-lua-runtime failed"
+            make package/luci-compat/compile V=s -j$(nproc) || echo "⚠️ luci-compat failed"
+          fi
+
+          # 编 athena-led
           echo "=== Building athena-led ==="
           make package/athena-led/compile V=s -j$(nproc)
 
-          # 编 luci-app-athena-led
+          # 编 luci-app
           echo "=== Building luci-app-athena-led ==="
           make package/luci-app-athena-led/compile V=s -j$(nproc)
 
           # 列出产物
           echo "=== Build artifacts ==="
-          find bin/ -name "*athena-led*" -ls
+          find bin/ -name "*athena-led*" \( -name "*.ipk" -o -name "*.apk" \) -ls
 
       - name: Generate checksums
         run: |
           cd sdk/bin
-          find . -name "*athena-led*" -type f | while read f; do
+          find . -name "*athena-led*" \( -name "*.ipk" -o -name "*.apk" \) -type f | while read f; do
             sha256sum "$f"
           done | sed 's# \./[^/]*/# #' > sha256sums-athena-led.txt
           cat sha256sums-athena-led.txt
@@ -225,19 +233,20 @@ jobs:
       - name: Upload Packages as Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: athena-led-${{ matrix.target }}
+          name: athena-led-${{ matrix.target }}-${{ matrix.fmt }}
           path: |
-            sdk/bin/**/*athena-led*
+            sdk/bin/**/*athena-led*.ipk
+            sdk/bin/**/*athena-led*.apk
             sdk/bin/sha256sums-athena-led.txt
           retention-days: 30
 
-      # 🌟 Release 时自动上传 IPK 到 Release 页面
       - name: Upload to Release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
           files: |
             sdk/bin/**/*athena-led*.ipk
+            sdk/bin/**/*athena-led*.apk
             sdk/bin/sha256sums-athena-led.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
