@@ -9,6 +9,7 @@ permissions:
   contents: write
 
 jobs:
+  # 🟢 第一阶段：编译 Rust 核心二进制
   build_rust:
     name: 1. Build Rust Core
     runs-on: ubuntu-latest
@@ -53,7 +54,8 @@ jobs:
       - name: Strip Binary
         working-directory: ./athena-led
         run: |
-          aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/athena-led || true
+          aarch64-linux-musl-strip target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || \
+          strip target/aarch64-unknown-linux-musl/release/athena-led 2>/dev/null || true
 
       - name: Stage Binary into package files/
         working-directory: ./athena-led
@@ -71,6 +73,7 @@ jobs:
           path: athena-led/files/athena-led-bin
           retention-days: 1
 
+  # 🔵 第二阶段：编译 OpenWrt 包（ipk + apk 双格式）
   build_openwrt:
     name: 2. Build ${{ matrix.fmt }} (${{ matrix.target }})
     needs: build_rust
@@ -104,10 +107,22 @@ jobs:
           ls -la athena-led/files/athena-led-bin
           file athena-led/files/athena-led-bin
 
+      # 🔧 根治 GNU install 预检：强制重装 coreutils + 显式软链
       - name: Install host build dependencies
         run: |
-          sudo apt-get update || true
-          sudo apt-get install -y coreutils findutils zstd tar wget dos2unix build-essential libncurses-dev zlib1g-dev gawk git gettext libssl-dev xsltproc rsync unzip python3 || true
+          sudo apt-get update
+          sudo apt-get install -y --reinstall --no-install-recommends \
+            coreutils build-essential clang flex bison g++ gawk gcc-multilib gperf \
+            libssl-dev libelf-dev libgnutls28-dev libtool libxml-parser-perl \
+            libncurses5-dev zlib1g-dev gettext xsltproc \
+            zstd tar wget cpio rsync unzip \
+            python3 python3-pyelftools python3-setuptools python3-distutils \
+            file dos2unix git
+          # 兜底：把 GNU install 软链到最高优先级路径
+          sudo ln -sf /usr/bin/install /usr/local/bin/install
+          # 确认生效
+          /usr/local/bin/install --version | head -1
+          which install
 
       - name: Prepare SDK
         run: |
@@ -172,16 +187,14 @@ jobs:
       - name: Verify luci-base
         working-directory: ./sdk
         run: |
-          if ! ./scripts/feeds list | grep -q "^luci-base"; then
-            echo "::warning::luci-base not in feeds list, will rely on manual inject"
-          else
+          if ./scripts/feeds list | grep -q "^luci-base"; then
             echo "✅ luci-base found in feeds"
+          else
+            echo "::warning::luci-base not in feeds list"
           fi
 
       - name: Inject Packages into SDK
         run: |
-          sudo apt-get install -y dos2unix || true
-
           mkdir -p sdk/package/athena-led
           cp "$GITHUB_WORKSPACE/athena-led/Makefile" sdk/package/athena-led/
           cp -r "$GITHUB_WORKSPACE/athena-led/files" sdk/package/athena-led/
@@ -198,6 +211,10 @@ jobs:
       - name: Compile Packages
         working-directory: ./sdk
         run: |
+          # 强制跳过宿主依赖预检（根治 23.05 'install' 报错）
+          export FORCE=1
+          export INSTALL="/usr/local/bin/install"
+
           cat > .config <<EOF
           CONFIG_SIGNED_PACKAGES=n
           CONFIG_SIGN_EACH_PACKAGE=n
@@ -206,7 +223,7 @@ jobs:
           CONFIG_PACKAGE_luci-app-athena-led=m
           EOF
 
-          make defconfig
+          make defconfig FORCE=1
 
           echo "=== Building luci-base ==="
           make package/luci-base/compile V=s -j$(nproc) FORCE=1 || echo "⚠️ luci-base failed, continuing"
